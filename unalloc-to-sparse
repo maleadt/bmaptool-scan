@@ -34,8 +34,8 @@ use constant  {
 
 sub error($) {
     my $error = shift;
-    print "$0: $error\n";
-    print "Try '$0 --help' for more information.\n";
+    print STDERR "$0: $error\n";
+    print STDERR "Try '$0 --help' for more information.\n";
     exit 1;
 }
 
@@ -110,7 +110,7 @@ foreach (@partlist) {
 }
 error("no partitions found in image") unless @partitions;
 error("could not find unit size in 'fdisk' output") unless defined($UnitSize);
-print "Found ", scalar @partitions, " partition(s) in image\n";
+print STDERR "Found ", scalar @partitions, " partition(s) in image\n";
 
 # Find out file system information, and extract unallocated blocks
 my @free;
@@ -119,7 +119,7 @@ error("loop device unavailable -- did you modprobe loop?") unless (-e $loop);
 foreach my $partition (@partitions) {
     $partition->{Offset} = $partition->{Start} * $UnitSize;
     $partition->{Size} = $partition->{Sectors} * $UnitSize;
-    print "- processing ", format_bytes($partition->{Size}), " partition at ",
+    print STDERR "- processing ", format_bytes($partition->{Size}), " partition at ",
           format_bytes($partition->{Offset}), " into the image\n";
 
     capturex('losetup', '--offset', $partition->{Offset},
@@ -157,7 +157,7 @@ foreach my $partition (@partitions) {
             }
         }
         else {
-            print "  unsupported file system (", $blkinfo{TYPE}, ")!\n";
+            print STDERR "  unsupported file system (", $blkinfo{TYPE}, ")!\n";
         }
     }
 
