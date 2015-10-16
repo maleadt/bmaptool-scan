@@ -18,9 +18,7 @@ use Fcntl qw(O_RDONLY SEEK_END);
 use File::stat;
 use Digest::SHA qw(sha256);
 
-use constant  {
-    SEEK_HOLE              => 0x04
-};
+use constant { SEEK_HOLE => 0x04 };
 
 # TODO: support partition images next to full-disk images
 # TODO: intelligently plug holes, based on current extent ranges
@@ -50,16 +48,17 @@ Options:
   -s, --sparse                     create sparseness
   -b, --bmap                       generate a bmap file
 EOD
-;
+      ;
 }
 
+# Euclid's algorithm
 sub gcd {
-  my ($a, $b) = @_;
-  ($a,$b) = ($b,$a) if $a > $b;
-  while ($a) {
-    ($a, $b) = ($b % $a, $a);
-  }
-  return $b;
+    my ($a, $b) = @_;
+    ($a,$b) = ($b,$a) if $a > $b;
+    while ($a) {
+        ($a, $b) = ($b % $a, $a);
+    }
+    return $b;
 }
 
 
@@ -71,7 +70,7 @@ my ($mode_bmap, $mode_sparse, $help);
 GetOptions("bmap"   => \$mode_bmap,
            "sparse" => \$mode_sparse,
            "help"   => \$help)
-or error("invalid commandline arguments\n");
+    or error("invalid commandline arguments\n");
 
 if ($help) {
     usage();
@@ -87,10 +86,14 @@ error("input image does not exist") unless -f $image;
 # Make sure the file isn't sparse yet
 if ($mode_sparse) {
     # Check if there are any holes
-    sysopen(my $fh, $image, O_RDONLY) || error("could not open input image ($!)");
+    sysopen(my $fh, $image, O_RDONLY)
+        or error("could not open input image ($!)");
     my $end = sysseek($fh, 0, SEEK_END);
     my $hole = sysseek($fh, 0, SEEK_HOLE);
-    error("cannot create addition sparseness, input image is already sparse\nUse 'dd if=$image of=$image conv=notrunc' to remove sparseness, or generate a bmap") if ($hole != $end);
+    error("cannot create addition sparseness, input image is already sparse\n" .
+          "Use 'dd if=$image of=$image conv=notrunc' to remove sparseness, " .
+          "or generate a bmap")
+        if ($hole != $end);
     close($fh) || die;
 }
 
@@ -104,13 +107,14 @@ foreach (@partlist) {
         @fields = split(/\s+/);
     } elsif (@fields && length) {
         my @values = split(/\s+/);
-        error("could not match fdisk values with header") if ($#values != $#fields);
+        error("could not match fdisk values with header")
+            if ($#values != $#fields);
         push @partitions, {zip @fields, @values};
     }
 }
 error("no partitions found in image") unless @partitions;
 error("could not find unit size in 'fdisk' output") unless defined($UnitSize);
-print STDERR "Found ", scalar @partitions, " partition(s) in image\n";
+printf STDERR "Found %d partition(s) in image\n", scalar @partitions;
 
 # Find out file system information, and extract unallocated blocks
 my @free;
@@ -119,8 +123,9 @@ error("loop device unavailable -- did you modprobe loop?") unless (-e $loop);
 foreach my $partition (@partitions) {
     $partition->{Offset} = $partition->{Start} * $UnitSize;
     $partition->{Size} = $partition->{Sectors} * $UnitSize;
-    print STDERR "- processing ", format_bytes($partition->{Size}), " partition at ",
-          format_bytes($partition->{Offset}), " into the image\n";
+    printf STDERR "- processing %s partition at %s into the image\n",
+                  format_bytes($partition->{Size}),
+                  format_bytes($partition->{Offset});
 
     capturex('losetup', '--offset', $partition->{Offset},
                         '--sizelimit', $partition->{Size},
@@ -157,7 +162,7 @@ foreach my $partition (@partitions) {
             }
         }
         else {
-            print STDERR "  unsupported file system (", $blkinfo{TYPE}, ")!\n";
+            printf STDERR "  unsupported file system (%s)!\n", $blkinfo{TYPE};
         }
     }
 
