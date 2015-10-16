@@ -6,12 +6,17 @@
 use strict;
 use warnings;
 
+use Getopt::Long;
+use XML::Writer;
 use IPC::System::Simple qw(capturex);
+use List::Util qw(reduce sum);
 use List::MoreUtils qw(zip);
 use Number::Bytes::Human qw(format_bytes);
 use Switch;
 use Clone 'clone';
 use Fcntl qw(O_RDONLY SEEK_END);
+use File::stat;
+use Digest::SHA qw(sha256);
 
 use constant  {
     SEEK_HOLE              => 0x04
@@ -22,24 +27,74 @@ use constant  {
 #       (see `filefrag`) and requested holes?
 # IDEA: or, alternatively, generate bmapfile instead of sparsifying the image
 
+
+#
+# Routines
+#
+
+sub error($) {
+    my $error = shift;
+    print "$0: $error\n";
+    print "Try '$0 --help' for more information.\n";
+    exit 1;
+}
+
+sub usage() {
+    print <<EOD
+Usage $0 [OPTION]... FILE
+Analyze the unallocated data in FILE
+and export this information for further use.
+
+Options:
+  -h, --help                       print this information
+  -s, --sparse                     create sparseness
+  -b, --bmap                       generate a bmap file
+EOD
+;
+}
+
+sub gcd {
+  my ($a, $b) = @_;
+  ($a,$b) = ($b,$a) if $a > $b;
+  while ($a) {
+    ($a, $b) = ($b % $a, $a);
+  }
+  return $b;
+}
+
+
 #
 # Main
 #
 
-my $image = shift || die("Usage: $0 IMAGE\n");
-die unless -f $image;
+my ($mode_bmap, $mode_sparse, $help);
+GetOptions("bmap"   => \$mode_bmap,
+           "sparse" => \$mode_sparse,
+           "help"   => \$help)
+or error("invalid commandline arguments\n");
+
+if ($help) {
+    usage();
+    exit 0;
+}
+
+error("no program mode selected -- use either --sparse or --bmap")
+unless ($mode_bmap or $mode_sparse);
+
+my $image = shift || error("did not specify an input image");
+error("input image does not exist") unless -f $image;
 
 # Make sure the file isn't sparse yet
-{
+if ($mode_sparse) {
     # Check if there are any holes
-    sysopen(my $fh, $image, O_RDONLY) || die;
+    sysopen(my $fh, $image, O_RDONLY) || error("could not open input image ($!)");
     my $end = sysseek($fh, 0, SEEK_END);
     my $hole = sysseek($fh, 0, SEEK_HOLE);
-    die("File is already sparse (use `dd if=$image of=$image conv=notrunc` to remove sparseness)\n") if ($hole != $end);
+    error("cannot create addition sparseness, input image is already sparse\nUse 'dd if=$image of=$image conv=notrunc' to remove sparseness, or generate a bmap") if ($hole != $end);
     close($fh) || die;
 }
 
-# Parse partition information using `fdisk`
+# Parse partition information using 'fdisk'
 my @partlist = capturex('fdisk', '-l', $image);
 my ($UnitSize, @fields, @partitions);
 foreach (@partlist) {
@@ -49,17 +104,18 @@ foreach (@partlist) {
         @fields = split(/\s+/);
     } elsif (@fields && length) {
         my @values = split(/\s+/);
-        die("Could not match fdisk values with header") if ($#values != $#fields);
+        error("could not match fdisk values with header") if ($#values != $#fields);
         push @partitions, {zip @fields, @values};
     }
 }
-die("No partitions found in image\n") unless @partitions;
-die("Could not find unit size in `fdisk` output\n") unless defined($UnitSize);
+error("no partitions found in image") unless @partitions;
+error("could not find unit size in 'fdisk' output") unless defined($UnitSize);
 print "Found ", scalar @partitions, " partition(s) in image\n";
 
-# Find out file system information
+# Find out file system information, and extract unallocated blocks
+my @free;
 my $loop = "/dev/loop0";
-die("Loop device unavailable -- did you modprobe loop?\n") unless (-e $loop);
+error("loop device unavailable -- did you modprobe loop?") unless (-e $loop);
 foreach my $partition (@partitions) {
     $partition->{Offset} = $partition->{Start} * $UnitSize;
     $partition->{Size} = $partition->{Sectors} * $UnitSize;
@@ -74,10 +130,9 @@ foreach my $partition (@partitions) {
                   capturex('blkid', '-o', 'export', $loop);
 
     # Handle known file systems
-    my @free;
     switch ($blkinfo{TYPE}) {
         case "ext4" {
-            # Parse free block information from `dumpe2fs`
+            # Parse free block information from 'dumpe2fs'
             # TODO: hide STDERR from dumpe2fs
             my @dump = capturex('dumpe2fs', $loop);
             my $BlockSize;
@@ -85,17 +140,17 @@ foreach my $partition (@partitions) {
                 if (m/^Block size:\s+(\d+)$/) {
                     $BlockSize = $1;
                 } elsif (defined $BlockSize && m/^\s+Free blocks: (.+)$/) {
-                    my @ranges = map { [split(/-/)] }   # Split `a-b`
-                                 split(/, /, $1);       # Split `a, b, c`
+                    my @ranges = map { [split(/-/)] }   # Split 'a-b'
+                                 split(/, /, $1);       # Split 'a, b, c'
                     foreach my $range (@ranges) {
                         my $first = $range->[0];
                         my $last = scalar @{$range} == 2 ? $range->[1] : $first;
 
                         push @free, {
-                            Begin   => $first           * $BlockSize,
-                            End     => ($last+1)        * $BlockSize,
+                            Begin  => $first           * $BlockSize + $partition->{Offset},
+                            End    => ($last+1)        * $BlockSize + $partition->{Offset},
 
-                            Length  => ($last-$first+1) * $BlockSize
+                            Length => ($last-$first+1) * $BlockSize
                         }
                     }
                 }
@@ -108,15 +163,103 @@ foreach my $partition (@partitions) {
 
     capturex('losetup', '-d', $loop);
 
-    # Punch holes in the original image file
-    for my $range (@free) {
-        my $range = clone $range;
-        $range->{Begin} += $partition->{Offset};
-        $range->{End}   += $partition->{Offset};
+}
 
+# Punch holes in the original image file
+if ($mode_sparse) {
+    for (@free) {
+        next if ($_->{Begin} <= 0);
         capturex("fallocate", "--punch-hole",
-                              "--offset", $range->{Begin},
-                              "--length", $range->{Length},
+                              "--offset", $_->{Begin},
+                              "--length", $_->{Length},
                               $image);
     }
+}
+
+# Generate a bmap file
+my $BlockSize = reduce { gcd($a, $b) } map { $_->{Begin}, $_->{End} } @free;
+if ($mode_bmap) {
+    my $xml = XML::Writer->new(OUTPUT => 'self',
+                               DATA_MODE => 1,
+                               DATA_INDENT => 1);
+    $xml->xmlDecl();
+    $xml->startTag('bmap', 'version' => '2.0');
+
+    my $size = stat($image)->size;
+    $xml->comment("Image size in bytes: " . format_bytes($size));
+    $xml->dataElement("ImageSize", $size);
+
+    $xml->comment("Size of a block in bytes");
+    $xml->dataElement("BlockSize", $BlockSize);
+
+    my $blocks = $size / $BlockSize;
+    $xml->comment("Count of blocks in the image file");
+    $xml->dataElement("BlocksCount", $blocks);
+
+    my $unmapped = (sum map { $_->{End} - $_->{Begin} } @free) / $BlockSize;
+    my $mapped = $blocks - $unmapped;
+    my $mappedSize = $mapped * $BlockSize;
+    $xml->comment(sprintf("Count of mapped blocks: %s or %.1f%%",
+                          format_bytes($mappedSize),
+                          100 * $mappedSize / $size));
+    $xml->dataElement("MappedBlocksCount", $mapped);
+
+    $xml->comment("Type of checksum used in this file");
+    $xml->dataElement("ChecksumType", "sha256");
+
+    my $dummy_checksum = "0" x 64;
+    $xml->comment("The checksum of this bmap file");
+    $xml->dataElement("BmapFileChecksum", $dummy_checksum);
+
+    # Invert @free to @mapped
+    my @mapped;
+    my $pointer = 0;
+    my $index = 0;
+    while ($index <= $#free) {
+        my $end = $free[$index]->{Begin};
+        push @mapped, {
+            Begin  => $pointer,
+            End    => $end,
+
+            Length => ($end - $pointer)
+        };
+
+        $pointer = $free[$index]->{End};
+        $index++;
+    }
+    if ($#free != -1) {
+        push @mapped, {
+            Begin  => $pointer,
+            End    => $size,
+
+            Length => ($size - $pointer)
+        };
+    }
+
+    $xml->startTag('BlockMap');
+    for (@mapped) {
+        next if ($_->{Length} <= 0);
+
+        my ($begin, $end) = @{$_}{'Begin', 'End'};
+        $begin /= $BlockSize;
+        $end /= $BlockSize;
+
+        if ($end-$begin == 1) {
+            $xml->dataElement("Range", $begin);
+        } else {
+            # NOTE: bmap boundaries appear to be inclusive; hence the '- 1'
+            $xml->dataElement("Range", sprintf("%d-%d", $begin, $end - 1));
+        }
+    }
+    $xml->endTag('BlockMap');
+
+    $xml->endTag('bmap');
+    $xml->end();
+
+    # Substitute with the real checksum
+    my $bmap = $xml->to_string();
+    my $checksum = unpack("H*", sha256($bmap));
+    $bmap =~  s/$dummy_checksum/$checksum/e;
+
+    print $bmap;
 }
