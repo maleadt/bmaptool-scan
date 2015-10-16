@@ -1,0 +1,122 @@
+#!/usr/bin/perl
+
+# Synopsis: punch holes in a device image file based on knowledge about the
+# underlying partition's file systems
+
+use strict;
+use warnings;
+
+use IPC::System::Simple qw(capturex);
+use List::MoreUtils qw(zip);
+use Number::Bytes::Human qw(format_bytes);
+use Switch;
+use Clone 'clone';
+use Fcntl qw(O_RDONLY SEEK_END);
+
+use constant  {
+    SEEK_HOLE              => 0x04
+};
+
+# TODO: support partition images next to full-disk images
+# TODO: intelligently plug holes, based on current extent ranges
+#       (see `filefrag`) and requested holes?
+# IDEA: or, alternatively, generate bmapfile instead of sparsifying the image
+
+#
+# Main
+#
+
+my $image = shift || die("Usage: $0 IMAGE\n");
+die unless -f $image;
+
+# Make sure the file isn't sparse yet
+{
+    # Check if there are any holes
+    sysopen(my $fh, $image, O_RDONLY) || die;
+    my $end = sysseek($fh, 0, SEEK_END);
+    my $hole = sysseek($fh, 0, SEEK_HOLE);
+    die("File is already sparse (use `dd if=$image of=$image conv=notrunc` to remove sparseness)\n") if ($hole != $end);
+    close($fh) || die;
+}
+
+# Parse partition information using `fdisk`
+my @partlist = capturex('fdisk', '-l', $image);
+my ($UnitSize, @fields, @partitions);
+foreach (@partlist) {
+    if (m/^Units: .* = (\d+) bytes$/) {
+        $UnitSize = $1;
+    } elsif (m/^Device /) {
+        @fields = split(/\s+/);
+    } elsif (@fields && length) {
+        my @values = split(/\s+/);
+        die("Could not match fdisk values with header") if ($#values != $#fields);
+        push @partitions, {zip @fields, @values};
+    }
+}
+die("No partitions found in image\n") unless @partitions;
+die("Could not find unit size in `fdisk` output\n") unless defined($UnitSize);
+print "Found ", scalar @partitions, " partition(s) in image\n";
+
+# Find out file system information
+my $loop = "/dev/loop0";
+die("Loop device unavailable -- did you modprobe loop?\n") unless (-e $loop);
+foreach my $partition (@partitions) {
+    $partition->{Offset} = $partition->{Start} * $UnitSize;
+    $partition->{Size} = $partition->{Sectors} * $UnitSize;
+    print "- processing ", format_bytes($partition->{Size}), " partition at ",
+          format_bytes($partition->{Offset}), " into the image\n";
+
+    capturex('losetup', '--offset', $partition->{Offset},
+                        '--sizelimit', $partition->{Size},
+                        $loop, $image);
+
+    my %blkinfo = map { chomp; split(/=/) }
+                  capturex('blkid', '-o', 'export', $loop);
+
+    # Handle known file systems
+    my @free;
+    switch ($blkinfo{TYPE}) {
+        case "ext4" {
+            # Parse free block information from `dumpe2fs`
+            # TODO: hide STDERR from dumpe2fs
+            my @dump = capturex('dumpe2fs', $loop);
+            my $BlockSize;
+            foreach (@dump) {
+                if (m/^Block size:\s+(\d+)$/) {
+                    $BlockSize = $1;
+                } elsif (defined $BlockSize && m/^\s+Free blocks: (.+)$/) {
+                    my @ranges = map { [split(/-/)] }   # Split `a-b`
+                                 split(/, /, $1);       # Split `a, b, c`
+                    foreach my $range (@ranges) {
+                        my $first = $range->[0];
+                        my $last = scalar @{$range} == 2 ? $range->[1] : $first;
+
+                        push @free, {
+                            Begin   => $first           * $BlockSize,
+                            End     => ($last+1)        * $BlockSize,
+
+                            Length  => ($last-$first+1) * $BlockSize
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            print "  unsupported file system (", $blkinfo{TYPE}, ")!\n";
+        }
+    }
+
+    capturex('losetup', '-d', $loop);
+
+    # Punch holes in the original image file
+    for my $range (@free) {
+        my $range = clone $range;
+        $range->{Begin} += $partition->{Offset};
+        $range->{End}   += $partition->{Offset};
+
+        capturex("fallocate", "--punch-hole",
+                              "--offset", $range->{Begin},
+                              "--length", $range->{Length},
+                              $image);
+    }
+}
