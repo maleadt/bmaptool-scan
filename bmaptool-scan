@@ -1,8 +1,5 @@
 #!/usr/bin/perl
 
-# Synopsis: punch holes in a device image file based on knowledge about the
-# underlying partition's file systems
-
 use strict;
 use warnings;
 
@@ -21,9 +18,8 @@ use Digest::SHA qw(sha256);
 use constant { SEEK_HOLE => 0x04 };
 
 # TODO: support partition images next to full-disk images
-# TODO: intelligently plug holes, based on current extent ranges
-#       (see `filefrag`) and requested holes?
-# IDEA: or, alternatively, generate bmapfile instead of sparsifying the image
+
+# TODO: more robust way of parsing partition table
 
 
 #
@@ -40,13 +36,14 @@ sub error($) {
 sub usage() {
     print <<EOD
 Usage $0 [OPTION]... FILE
-Analyze the unallocated data in FILE
-and export this information for further use.
+Scan for unallocated blocks in FILE
+and export this information for further use by bmaptool.
 
 Options:
   -h, --help                       print this information
-  -s, --sparse                     create sparseness
-  -b, --bmap                       generate a bmap file
+
+  -s, --sparse                     generate sparseness
+  -b, --bmap                       create a bmap file
 EOD
       ;
 }
@@ -138,7 +135,7 @@ foreach my $partition (@partitions) {
     switch ($blkinfo{TYPE}) {
         case "ext4" {
             # Parse free block information from 'dumpe2fs'
-            # TODO: hide STDERR from dumpe2fs
+            # TODO: hide banner on STDERR
             my @dump = capturex('dumpe2fs', $loop);
             my $BlockSize;
             foreach (@dump) {
