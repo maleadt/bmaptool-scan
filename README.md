@@ -31,6 +31,17 @@ workaround:
     $ sudo PERL5LIB=$PERL5LIB bmaptool-scan ...
 
 
+Motivation
+----------
+
+See [this blog post](http://blog.maleadt.net/2015/11/24/bmaptool-scan/) for an
+explanation. The short version: `bmaptool create` relies on file sparseness to
+generate a `bmap` file, but these semantics do not map what `bmaptool` uses them
+for (return 0 upon read vs. skip writing and return garbage upon read). This
+script parses the underlying file systems in order to discover the actually
+unused blocks, which can be safely skipped when writing an image.
+
+
 
 TODO
 ----
