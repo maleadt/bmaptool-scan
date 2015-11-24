@@ -3,6 +3,7 @@
 use strict;
 use warnings;
 
+use POSIX qw(uname);
 use Getopt::Long;
 use XML::Writer;
 use IPC::System::Simple qw(capturex);
@@ -10,16 +11,17 @@ use List::Util qw(reduce sum);
 use List::MoreUtils qw(zip);
 use Number::Bytes::Human qw(format_bytes);
 use Switch;
-use Clone 'clone';
 use Fcntl qw(O_RDONLY SEEK_END);
 use File::stat;
 use Digest::SHA qw(sha256);
 
+# SEEK_HOLE is not available everywhere
+my @uname = uname();
+my $os = $uname[0];
+my ($version) = $uname[2] =~ m/^\d+/;
+die("This script only works on Linux 3.1 or higher")
+    unless ($os eq "Linux" && version->parse($version) < version->parse("3.1"));
 use constant { SEEK_HOLE => 0x04 };
-
-# TODO: support partition images next to full-disk images
-
-# TODO: more robust way of parsing partition table
 
 
 #
@@ -75,7 +77,7 @@ if ($help) {
 }
 
 error("no program mode selected -- use either --sparse or --bmap")
-unless ($mode_bmap or $mode_sparse);
+    unless ($mode_bmap or $mode_sparse);
 
 my $image = shift || error("did not specify an input image");
 error("input image does not exist") unless -f $image;
@@ -87,17 +89,17 @@ if ($mode_sparse) {
         or error("could not open input image ($!)");
     my $end = sysseek($fh, 0, SEEK_END);
     my $hole = sysseek($fh, 0, SEEK_HOLE);
-    error("cannot create addition sparseness, input image is already sparse\n" .
+    error("cannot create sparseness as the input image is already sparse\n" .
           "Use 'dd if=$image of=$image conv=notrunc' to remove sparseness, " .
-          "or generate a bmap")
+          "or generate a bmap instead")
         if ($hole != $end);
     close($fh) || die;
 }
 
 # Parse partition information using 'fdisk'
-my @partlist = capturex('fdisk', '-l', $image);
+my @output = capturex('fdisk', '-l', $image);
 my ($UnitSize, @fields, @partitions);
-foreach (@partlist) {
+foreach (@output) {
     if (m/^Units: .* = (\d+) bytes$/) {
         $UnitSize = $1;
     } elsif (m/^Device /) {
@@ -164,7 +166,6 @@ foreach my $partition (@partitions) {
     }
 
     capturex('losetup', '-d', $loop);
-
 }
 
 # Punch holes in the original image file
