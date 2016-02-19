@@ -96,23 +96,36 @@ if ($mode_sparse) {
     close($fh) || die;
 }
 
-# Parse partition information using 'fdisk'
-my @output = capturex('fdisk', '-l', $image);
-my ($UnitSize, @fields, @partitions);
+# Parse partition information using 'sfdisk'
+## unit size
+my @output = capturex('sfdisk', '-l', $image);
+my $UnitSize;
 foreach (@output) {
     if (m/^Units: .* = (\d+) bytes$/) {
         $UnitSize = $1;
-    } elsif (m/^Device /) {
-        @fields = split(/\s+/);
-    } elsif (@fields && length) {
-        my @values = split(/\s+/);
-        error("could not match fdisk values with header")
-            if ($#values != $#fields);
-        push @partitions, {zip @fields, @values};
+    }
+}
+error("could not find unit size in 'sfdisk' output") unless defined($UnitSize);
+## parse partitions
+@output = capturex('sfdisk', '-d', $image);
+my @partitions;
+foreach (@output) {
+    if (m/^(.+?) : (.+)$/) {
+        my $name = $1;
+        my @properties = split(/, /, $2);
+        my %partition;
+        foreach (@properties) {
+            my @kv = split(/=/);
+            push(@kv, 1) if scalar(@kv)==1;
+            $kv[1] =~ s/^\s+//; # ltrim
+            $partition{$kv[0]} = $kv[1];
+        }
+        $partition{start} *= $UnitSize;
+        $partition{size} *= $UnitSize;
+        push @partitions, \%partition;
     }
 }
 error("no partitions found in image") unless @partitions;
-error("could not find unit size in 'fdisk' output") unless defined($UnitSize);
 printf STDERR "Found %d partition(s) in image\n", scalar @partitions;
 
 # Find out file system information, and extract unallocated blocks
@@ -120,14 +133,12 @@ my @free;
 my $loop = "/dev/loop0";
 error("loop device unavailable -- did you modprobe loop?") unless (-e $loop);
 foreach my $partition (@partitions) {
-    $partition->{Offset} = $partition->{Start} * $UnitSize;
-    $partition->{Size} = $partition->{Sectors} * $UnitSize;
     printf STDERR "- processing %s partition at %s into the image\n",
-                  format_bytes($partition->{Size}),
-                  format_bytes($partition->{Offset});
+                  format_bytes($partition->{size}),
+                  format_bytes($partition->{start});
 
-    capturex('losetup', '--offset', $partition->{Offset},
-                        '--sizelimit', $partition->{Size},
+    capturex('losetup', '--offset', $partition->{start},
+                        '--sizelimit', $partition->{size},
                         $loop, $image);
 
     my %blkinfo = map { chomp; split(/=/) }
@@ -151,8 +162,8 @@ foreach my $partition (@partitions) {
                         my $last = scalar @{$range} == 2 ? $range->[1] : $first;
 
                         push @free, {
-                            Begin  => $first           * $BlockSize + $partition->{Offset},
-                            End    => ($last+1)        * $BlockSize + $partition->{Offset},
+                            Begin  => $first           * $BlockSize + $partition->{start},
+                            End    => ($last+1)        * $BlockSize + $partition->{start},
 
                             Length => ($last-$first+1) * $BlockSize
                         }
